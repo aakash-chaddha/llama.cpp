@@ -495,6 +495,15 @@ std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_
     return { nullptr, 0 };
 }
 
+std::vector<std::pair<size_t, const mtmd_input_chunk *>> server_tokens::media_chunks() const {
+    std::vector<std::pair<size_t, const mtmd_input_chunk *>> res;
+    res.reserve(map_idx_to_media.size());
+    for (const auto & it : map_idx_to_media) {
+        res.push_back({ it.first, it.second.get() });
+    }
+    return res;
+}
+
 void server_tokens::push_back(llama_token tok) {
     if (tok == LLAMA_TOKEN_NULL) {
         throw std::runtime_error("Invalid token");
@@ -932,7 +941,8 @@ server_tokens process_mtmd_prompt(
         const std::string & prompt,
         const std::vector<raw_buffer> & files,
         const mtmd_helper_init_opt & init_opt,
-        bool is_placeholder) {
+        bool is_placeholder,
+        bool add_special) {
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
@@ -952,7 +962,7 @@ server_tokens process_mtmd_prompt(
     mtmd_input_text inp_txt = {
         prompt.data(),
         prompt.size(),
-        /* add_special */   true,
+        /* add_special */   add_special,
         /* parse_special */ true,
     };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
@@ -1076,7 +1086,7 @@ json oaicompat_completion_params_parse(const json & body) {
 // - file:// for local files (only allowed if media_path is set)
 // - data: for base64 encoded data with uri scheme (e.g. data:image/png;base64,...)
 // - raw base64 encoded data
-static void handle_media(
+void handle_media(
         std::vector<raw_buffer> & out_files,
         const std::string & url,
         const std::string & media_path) {

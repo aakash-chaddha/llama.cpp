@@ -2385,14 +2385,61 @@ private:
         }
         // one decision per context; all contexts share the schema, the instructions and the cached prefix
         if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > 256) {
-            throw std::invalid_argument("\"contexts\" must be an array of 1-256 strings");
+            throw std::invalid_argument("\"contexts\" must be an array of 1-256 contexts");
         }
-        std::vector<std::string> contexts;
+        // one context is a string, or an array of content parts: any number of text parts and at
+        // most one image_url holding a base64 data URL. Audio and video are not supported.
+        struct parsed_context {
+            std::string             text;
+            std::vector<raw_buffer> images; // 0 or 1
+        };
+        std::vector<parsed_context> parsed;
+        parsed.reserve(body.at("contexts").size());
         for (const auto & c : body.at("contexts")) {
-            if (!c.is_string() || c.get<std::string>().empty()) {
-                throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
+            parsed_context ctx;
+            if (c.is_string()) {
+                ctx.text = c.get<std::string>();
+                if (ctx.text.empty()) {
+                    throw std::invalid_argument("every entry of \"contexts\" must be a non-empty string");
+                }
+            } else if (c.is_array()) {
+                if (c.empty()) {
+                    throw std::invalid_argument("a \"contexts\" entry must not be an empty array of parts");
+                }
+                for (const auto & part : c) {
+                    if (!part.is_object()) {
+                        throw std::invalid_argument("every content part of \"contexts\" must be an object");
+                    }
+                    const std::string type = part.value("type", std::string());
+                    if (type == "text") {
+                        if (!part.contains("text") || !part.at("text").is_string()) {
+                            throw std::invalid_argument("a \"text\" content part needs a string \"text\"");
+                        }
+                        ctx.text += part.at("text").get<std::string>();
+                    } else if (type == "image_url") {
+                        if (!mctx || !mtmd_support_vision(mctx)) {
+                            throw std::invalid_argument("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                        }
+                        if (!ctx.images.empty()) {
+                            throw std::invalid_argument("a decision context takes at most one image");
+                        }
+                        const json image_url = part.value("image_url", json::object());
+                        const std::string url = image_url.value("url", std::string());
+                        if (!string_starts_with(url, "data:image/")) {
+                            throw std::invalid_argument("a decision image must be a base64 data:image/... URL");
+                        }
+                        handle_media(ctx.images, url, std::string());
+                        if (ctx.images.empty()) {
+                            throw std::invalid_argument("could not decode the decision image");
+                        }
+                    } else {
+                        throw std::invalid_argument("\"contexts\" content parts support \"text\" and \"image_url\", got \"" + type + "\"");
+                    }
+                }
+            } else {
+                throw std::invalid_argument("every entry of \"contexts\" must be a string or an array of content parts");
             }
-            contexts.push_back(c.get<std::string>());
+            parsed.push_back(std::move(ctx));
         }
         if (!body.contains("schema")) {
             throw std::invalid_argument("\"schema\" must be provided");
@@ -2402,32 +2449,125 @@ private:
                                                                         params_base.n_seq_decision);
         }
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
+
         std::string shared;
-        std::vector<std::string> dynamic;
-        for (const auto & c : contexts) {
-            auto [head, tail] = llama_decision::render_prompt(chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text, c);
-            if (dynamic.empty()) {
+        std::vector<std::vector<llama_decision::context_segment>> segments(parsed.size());
+        std::vector<server_tokens> tokenized; // keeps this request's media chunks alive
+        tokenized.reserve(parsed.size());
+        std::vector<const mtmd_input_chunk *> media_chunks;
+        std::vector<size_t> context_media_tokens(parsed.size(), 0);
+        for (size_t i = 0; i < parsed.size(); ++i) {
+            auto & ctx = parsed[i];
+            std::vector<std::string> markers;
+            if (!ctx.images.empty()) {
+                markers.push_back(get_media_marker());
+            }
+            auto [head, tail] = llama_decision::render_prompt(chat_params.tmpls.get(), chat_params.use_jinja,
+                                                              cs.system_text, ctx.text, markers);
+            if (i == 0) {
                 shared = head;
             } else if (head != shared) {
                 throw std::runtime_error("the chat template renders a different prefix per context");
             }
-            dynamic.push_back(tail);
+            if (ctx.images.empty()) {
+                segments[i].push_back(llama_decision::context_segment::of_text(
+                    llama_decision::tokenize_text(vocab, tail, shared.empty())));
+                continue;
+            }
+            // the tail carries the media marker: mtmd splits it into text chunks around one image chunk
+            tokenized.push_back(process_mtmd_prompt(mctx, tail, ctx.images, init_opt,
+                                                    /*is_placeholder*/ false, /*add_special*/ shared.empty()));
+            const auto & st    = tokenized.back();
+            const auto   media = st.media_chunks();
+            llama_decision::tokens_t text;
+            for (size_t idx = 0, next = 0; idx < st.size();) {
+                if (next < media.size() && media[next].first == idx) {
+                    if (!text.empty()) {
+                        segments[i].push_back(llama_decision::context_segment::of_text(std::move(text)));
+                        text.clear();
+                    }
+                    const auto * chunk = media[next].second;
+                    segments[i].push_back(llama_decision::context_segment::of_media((int) media_chunks.size()));
+                    media_chunks.push_back(chunk);
+                    context_media_tokens[i] += mtmd_input_chunk_get_n_tokens(chunk);
+                    idx += mtmd_input_chunk_get_n_tokens(chunk);
+                    ++next;
+                } else {
+                    text.push_back(st[idx]);
+                    ++idx;
+                }
+            }
+            if (!text.empty()) {
+                segments[i].push_back(llama_decision::context_segment::of_text(std::move(text)));
+            }
         }
+
+        // a whole image must fit in one ubatch: the decode asserts on it, so refuse it here instead
+        const size_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        for (const auto * chunk : media_chunks) {
+            const size_t n = mtmd_input_chunk_get_n_tokens(chunk);
+            if (n > n_ubatch) {
+                throw std::invalid_argument("image needs " + std::to_string(n) +
+                                            " tokens, raise --ubatch-size to at least " + std::to_string(n));
+            }
+        }
+
+        // encode every image once; the batches keep the embeddings alive for the whole scoring pass
+        std::vector<float *>         media_embds;
+        std::vector<mtmd::batch_ptr> media_batches;
+        media_embds.reserve(media_chunks.size());
+        media_batches.reserve(media_chunks.size());
+        for (const auto * chunk : media_chunks) {
+            mtmd::batch_ptr mbatch(mtmd_batch_init(mctx));
+            int32_t rc = mtmd_batch_add_chunk(mbatch.get(), chunk);
+            if (rc == 0) {
+                rc = mtmd_batch_encode(mbatch.get());
+            }
+            if (rc != 0) {
+                throw std::runtime_error("failed to encode the decision image (rc = " + std::to_string(rc) + ")");
+            }
+            float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk);
+            if (embd == nullptr) {
+                throw std::runtime_error("the image encoder returned no embeddings");
+            }
+            media_embds.push_back(embd);
+            media_batches.push_back(std::move(mbatch));
+        }
+
+        llama_decision::media_decoder decode_media;
+        if (!media_chunks.empty()) {
+            decode_media = [&](llama_seq_id seq, llama_pos pos, int idx) -> llama_pos {
+                llama_pos     new_n_past = pos;
+                const int32_t rc = mtmd_helper_decode_image_chunk(mctx, ctx_tgt, media_chunks[idx], media_embds[idx],
+                                                                  pos, seq, llama_n_batch(ctx_tgt), &new_n_past,
+                                                                  nullptr, nullptr);
+                if (rc != 0) {
+                    throw std::runtime_error("failed to decode the image into a decision branch (rc = " + std::to_string(rc) + ")");
+                }
+                return new_n_past;
+            };
+        }
+
         llama_decision::options opt;
         opt.mode        = body.value("mode", std::string("auto"));
         opt.tree_max    = (size_t) body.value("tree_max", 128);
         opt.allow_cache = body.value("cache_prompt", true);
 
-        const auto b = decision_engine->decide_batch(shared, dynamic, cs.inputs, opt);
+        const auto b = decision_engine->decide_batch_media(shared, segments, cs.inputs, opt, decode_media);
 
         size_t context_tokens = 0;
+        size_t media_tokens   = 0;
         for (const auto & r : b.items) {
             context_tokens += r.context_tokens;
         }
+        for (size_t n : context_media_tokens) {
+            media_tokens += n;
+        }
         json usage = json::object();
-        usage["prompt_tokens"]  = (long long) (b.shared_tokens + context_tokens);
+        usage["prompt_tokens"]  = (long long) (b.shared_tokens + context_tokens + media_tokens);
         usage["cached_tokens"]  = (long long) (b.cache_hit ? b.shared_tokens : 0);
         usage["context_tokens"] = (long long) context_tokens;
+        usage["media_tokens"]   = (long long) media_tokens;
         usage["scored_rows"]    = b.rows;
         json timings = json::object();
         timings["prefill_ms"] = b.prefill_ms;
@@ -2437,9 +2577,12 @@ private:
         timings["per_decision_ms"] = (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
 
         json results = json::array();
-        for (const auto & r : b.items) {
+        for (size_t i = 0; i < b.items.size(); ++i) {
+            const auto & r = b.items[i];
             json item = llama_decision::assemble(cs, r);
-            item["usage"] = { { "context_tokens", (long long) r.context_tokens }, { "scored_rows", r.rows } };
+            item["usage"] = { { "context_tokens", (long long) r.context_tokens },
+                              { "media_tokens",   (long long) context_media_tokens[i] },
+                              { "scored_rows",    r.rows } };
             results.push_back(item);
         }
         json out = json::object();

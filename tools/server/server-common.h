@@ -188,6 +188,9 @@ public:
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
+    // every media chunk in token order, as (start index in tokens, chunk)
+    std::vector<std::pair<size_t, const mtmd_input_chunk *>> media_chunks() const;
+
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
@@ -272,12 +275,20 @@ size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
+// add_special controls the BOS of the text parts; pass false when a cached prefix precedes this prompt
 server_tokens process_mtmd_prompt(
                                         mtmd_context * mctx,
                                         const std::string & prompt,
                                         const std::vector<raw_buffer> & files,
                                         const mtmd_helper_init_opt & init_opt,
-                                        bool is_placeholder = false);
+                                        bool is_placeholder = false,
+                                        bool add_special = true);
+
+// decode one media URL into raw bytes: data: base64, http(s), file:// (with media_path) or bare base64
+void handle_media(
+                                        std::vector<raw_buffer> & out_files,
+                                        const std::string & url,
+                                        const std::string & media_path);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them

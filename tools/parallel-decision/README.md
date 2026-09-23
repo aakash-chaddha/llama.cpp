@@ -59,8 +59,9 @@ length, so branches run in several passes instead of one.
 
 ## POST /v1/decision
 
-`contexts` is a list of 1-256 strings. They share one schema, one set of instructions, and one cached prefix; results
-come back in the same order.
+`contexts` is a list of 1-256 contexts. They share one schema, one set of instructions, and one cached prefix; results
+come back in the same order. A context is either a plain string, or an array of content parts (see
+[Media contexts](#media-contexts)).
 
 ```bash
 curl http://localhost:8096/v1/decision -H "Content-Type: application/json" -d '{
@@ -119,6 +120,38 @@ Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 | `mode` | `auto` | `tree` scores every divergence node and returns exact probabilities; `greedy` walks the trie; `auto` picks tree up to `tree_max` values |
 | `tree_max` | 128 | per-field switch between tree and greedy |
 | `cache_prompt` | true | reuse the cached instructions + schema prefix |
+
+### Media contexts
+
+A context can be a string, or an array of content parts made of any number of `text` parts and **at most one**
+`image_url`. The image must be a base64 `data:image/...` URL; audio, video and more than one image per context are
+rejected with a 400, and the model needs an `mmproj` (`--mmproj`). This is the OpenAI content-part shape the chat
+endpoint already takes, so a multimodal client can address `/v1/decision` directly:
+
+```json
+{
+  "model": "gemma-4-12b",
+  "instructions": "Count what the animal in the image shows. The pixels are the evidence.",
+  "schema": {
+    "type":  {"type": "enum", "choices": ["animal", "person", "object"], "description": "The main subject."},
+    "legs":  {"type": "integer", "minimum": 0, "maximum": 5, "description": "How many legs are visible."}
+  },
+  "contexts": [[
+    {"type": "text", "text": ""},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+  ]]
+}
+```
+
+The pixels are the evidence: the image is encoded once per request and decoded into the decision's trunk before the
+branches fork, so every field is scored conditioned on the image itself - no caption is generated in between, and the
+whole request is one pass. `usage.media_tokens` (per result and per request) reports how many memory cells the image
+occupied; `prompt_tokens` includes them.
+
+A whole image has to fit in one `ubatch`, because the non-causal attention span cannot be split. If it does not, the
+request fails with `image needs N tokens, raise --ubatch-size to at least N` instead of aborting the server - so set
+`--ubatch-size` (or `ubatch-size` in a preset) to at least the largest image you expect. Text parts keep the cached
+shared prefix, and a request can mix image contexts and plain-text contexts in any order.
 
 ## CLI
 
