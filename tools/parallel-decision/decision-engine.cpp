@@ -181,7 +181,7 @@ engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
     }
 }
 
-tokens_t engine::tokenize(const std::string & text, bool add_special) const {
+tokens_t tokenize_text(const llama_vocab * vocab, const std::string & text, bool add_special) {
     tokens_t toks = common_tokenize(vocab, text, add_special, /*parse_special=*/ true);
     // a chat template may already start with the BOS text; keep a single BOS
     const llama_token bos = llama_vocab_bos(vocab);
@@ -297,17 +297,33 @@ result engine::decide(const std::string & shared_text, const std::string & conte
 
 batch_result engine::decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
                                   const std::vector<field_input> & inputs, const options & opt) {
+    // one text segment per context, so the text-only path is a special case of the media path
+    const tokens_t shared = tokenize_text(vocab, shared_text, true);
+    std::vector<std::vector<context_segment>> segments;
+    segments.reserve(contexts.size());
+    for (const auto & text : contexts) {
+        segments.push_back({ context_segment::of_text(tokenize_text(vocab, text, shared.empty())) });
+    }
+    return decide_batch_media(shared_text, segments, inputs, opt, media_decoder());
+}
+
+batch_result engine::decide_batch_media(const std::string & shared_text,
+                                        const std::vector<std::vector<context_segment>> & contexts,
+                                        const std::vector<field_input> & inputs, const options & opt,
+                                        const media_decoder & decode_media) {
     if (opt.mode != "auto" && opt.mode != "tree" && opt.mode != "greedy") {
         throw std::invalid_argument("mode must be auto, tree or greedy");
     }
     if (contexts.empty()) {
         throw std::invalid_argument("a decision needs at least one context");
     }
-    const tokens_t shared = tokenize(shared_text, true);
-    std::vector<tokens_t> prefixes;
-    for (const auto & text : contexts) {
-        prefixes.push_back(tokenize(text, shared.empty()));
-        if (prefixes.back().empty()) {
+    const tokens_t shared = tokenize_text(vocab, shared_text, true);
+    for (const auto & c : contexts) {
+        size_t n = 0;
+        for (const auto & s : c) {
+            n += s.kind == context_segment::TEXT ? s.toks.size() : 1;
+        }
+        if (n == 0) {
             throw std::invalid_argument("the decision context must not be empty");
         }
     }
@@ -324,16 +340,16 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         std::vector<tokens_t> paths;
         if (opt.split_boundary) {
             for (const auto & c : in.candidates) {
-                paths.push_back(tokenize(c + "\n", false));
+                paths.push_back(tokenize_text(vocab, c + "\n", false));
             }
-            suffix = tokenize(in.suffix, false);
+            suffix = tokenize_text(vocab, in.suffix, false);
         } else {
             // Tokenise each complete "suffix + value + terminator" and split at the longest token
             // prefix shared by every candidate: the value's first token is exactly what the model
             // would write itself (e.g. `":` then ` true`, not `": ` then `true`).
             std::vector<tokens_t> seqs;
             for (const auto & c : in.candidates) {
-                seqs.push_back(tokenize(in.suffix + c + "\n", false));
+                seqs.push_back(tokenize_text(vocab, in.suffix + c + "\n", false));
             }
             size_t common = seqs[0].size();
             for (const auto & s : seqs) {
@@ -384,16 +400,52 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         const size_t n_group = std::min(per_group, contexts.size() - g0);
 
         const auto tp = std::chrono::steady_clock::now();
-        std::vector<prompt_part> parts;
+        std::vector<llama_pos> end_pos(n_group, (llama_pos) shared.size()); // running n_past per context
+        std::vector<size_t>    text_tokens(n_group, 0);
         for (size_t i = 0; i < n_group; ++i) {
             const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
             llama_memory_seq_rm(mem, trunk, -1, -1);
             if (!shared.empty()) {
                 llama_memory_seq_cp(mem, seq_snap, trunk, -1, -1);
             }
-            parts.push_back({ &prefixes[g0 + i], (llama_pos) shared.size(), trunk });
         }
-        decode_parts(parts);
+        // Walk the contexts segment by segment: one packed batch holds every context's text for a
+        // round, then each context's media chunk is decoded on its own (a media decode owns the
+        // whole context and may advance the position by more than its token count).
+        size_t n_rounds = 0;
+        for (size_t i = 0; i < n_group; ++i) {
+            n_rounds = std::max(n_rounds, contexts[g0 + i].size());
+        }
+        for (size_t r = 0; r < n_rounds; ++r) {
+            std::vector<prompt_part> parts;
+            std::vector<size_t>     media_ctx;
+            for (size_t i = 0; i < n_group; ++i) {
+                const auto & segs = contexts[g0 + i];
+                if (r >= segs.size()) {
+                    continue;
+                }
+                const auto & seg = segs[r];
+                if (seg.kind == context_segment::TEXT) {
+                    if (!seg.toks.empty()) {
+                        parts.push_back({ &seg.toks, end_pos[i], seq_pool + (llama_seq_id) i });
+                    }
+                    end_pos[i]    += (llama_pos) seg.toks.size();
+                    text_tokens[i] += seg.toks.size();
+                } else {
+                    media_ctx.push_back(i);
+                }
+            }
+            decode_parts(parts);
+            for (size_t i : media_ctx) {
+                if (!decode_media) {
+                    throw std::runtime_error("this decision was built without a media decoder");
+                }
+                end_pos[i] = decode_media(seq_pool + (llama_seq_id) i, end_pos[i], contexts[g0 + i][r].media);
+            }
+            if (!media_ctx.empty()) {
+                llama_synchronize(ctx); // bill the media decode to the prefill, not to scoring
+            }
+        }
         llama_synchronize(ctx); // llama_decode is asynchronous: wait for the prefill so its time isn't billed to scoring
         out.prefill_ms += ms_since(tp);
 
@@ -407,7 +459,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
             std::vector<std::pair<size_t, size_t>> owner; // (context in group, field)
             for (size_t i = 0; i < n_group; ++i) {
                 const llama_seq_id trunk = seq_pool + (llama_seq_id) i;
-                const llama_pos    pos0  = (llama_pos) (shared.size() + prefixes[g0 + i].size());
+                const llama_pos    pos0  = end_pos[i];
                 for (size_t f = 0; f < state[i].size(); ++f) {
                     auto & fd = state[i][f];
                     if (fd.use_tree) {
@@ -465,7 +517,7 @@ batch_result engine::decide_batch(const std::string & shared_text, const std::ve
         for (size_t i = 0; i < n_group; ++i) {
             llama_memory_seq_rm(mem, seq_pool + (llama_seq_id) i, -1, -1);
             result & r = out.items[g0 + i];
-            r.context_tokens = prefixes[g0 + i].size();
+            r.context_tokens = text_tokens[i];
             r.rows           = total;
             for (auto & fd : state[i]) {
                 if (fd.use_tree && fd.probs.empty()) {
@@ -642,9 +694,14 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
 }
 
 std::pair<std::string, std::string> render_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                  const std::string & system_text, const std::string & context) {
+                                                  const std::string & system_text, const std::string & context,
+                                                  const std::vector<std::string> & media_markers) {
+    std::string markers;
+    for (const auto & m : media_markers) {
+        markers += m;
+    }
     if (tmpls == nullptr) {
-        return { system_text + "\nContext:\n", context + "\nOutput:\n{\n" };
+        return { system_text + "\nContext:\n", context + markers + "\nOutput:\n{\n" };
     }
     static const std::string sentinel = "\x1f<<decision-context>>\x1f";
     common_chat_templates_inputs in;
@@ -656,7 +713,7 @@ std::pair<std::string, std::string> render_prompt(const common_chat_templates * 
     sys.content = system_text;
     common_chat_msg usr;
     usr.role    = "user";
-    usr.content = sentinel;
+    usr.content = sentinel + markers;
     in.messages = { sys, usr };
     const std::string prompt = common_chat_templates_apply(tmpls, in).prompt;
     const size_t at = prompt.find(sentinel);

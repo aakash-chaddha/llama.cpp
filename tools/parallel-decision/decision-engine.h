@@ -13,6 +13,7 @@
 #include "llama.h"
 #include "json.h"
 
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +56,35 @@ struct result {
     double scoring_ms     = 0;
 };
 
+// A context is a list of alternating segments: text the engine tokenises itself, or a reference to
+// media the caller has already encoded elsewhere. Media is decoded through a media_decoder callback
+// (the engine itself does not know about images, only about an integer index and a position).
+struct context_segment {
+    enum kind_t { TEXT, MEDIA };
+
+    kind_t   kind  = TEXT;
+    tokens_t toks;      // TEXT: tokens to decode causally at the running position
+    int      media = -1; // MEDIA: index into the caller's list of encoded media
+
+    static context_segment of_text(tokens_t t) {
+        context_segment s;
+        s.kind = TEXT;
+        s.toks = std::move(t);
+        return s;
+    }
+    static context_segment of_media(int index) {
+        context_segment s;
+        s.kind  = MEDIA;
+        s.media = index;
+        return s;
+    }
+};
+
+// Decodes media `media_index` into (seq, pos) on the engine's own context and returns the position
+// after it, exactly like mtmd_helper_decode_image_chunk's new_n_past (M-RoPE may advance by a
+// different amount than the token count). Called from the engine's thread, one sequence at a time.
+using media_decoder = std::function<llama_pos(llama_seq_id seq, llama_pos pos, int media_index)>;
+
 // Several contexts decided against one schema and one cached prefix. Items carry fields,
 // context_tokens and rows; timings and cache state cover the whole batch.
 struct batch_result {
@@ -82,6 +112,15 @@ class engine {
     batch_result decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
                               const std::vector<field_input> & fields, const options & opt);
 
+    // Same, but every context is a list of text/media segments. Text is prefilled in packed batches,
+    // one round at a time; each media segment is decoded through `decode_media` on its own sequence,
+    // so the caller owns M-RoPE positions and the non-causal span. `decode_media` may be empty when
+    // no context has a media segment.
+    batch_result decide_batch_media(const std::string & shared_text,
+                                    const std::vector<std::vector<context_segment>> & contexts,
+                                    const std::vector<field_input> & fields, const options & opt,
+                                    const media_decoder & decode_media);
+
   private:
     struct prompt_part {
         const tokens_t * toks;
@@ -102,7 +141,6 @@ class engine {
     int                 n_pool;
     tokens_t            cached;
 
-    tokens_t tokenize(const std::string & text, bool add_special) const;
     void     decode_parts(const std::vector<prompt_part> & parts);
     bool     prepare_prefix(const tokens_t & shared, bool allow_cache);
     std::vector<std::vector<float>> score_branches(const std::vector<branch> & branches, llama_seq_id first, int n_free);
@@ -130,11 +168,19 @@ struct compiled_schema {
 // object with "properties" (boolean, string+enum, integer min/max, number min/max/multipleOf).
 compiled_schema compile_schema(const common_json & schema, const std::string & instructions);
 
+// Tokenises a context string the way the engine does: parse_special, a single BOS (a chat template
+// may already start with the BOS text). `add_special` is false when a cached prefix precedes it.
+// Shared with the server so the text-only path and the text segments of a media context cannot drift.
+tokens_t tokenize_text(const llama_vocab * vocab, const std::string & text, bool add_special);
+
 // Renders system + user messages with the model's chat template (thinking disabled) and splits
 // the prompt into the static prefix (cached across requests) and the per-request part: the
-// context, the generation prompt and the opening brace of the JSON answer.
+// context, the generation prompt and the opening brace of the JSON answer. `media_markers` are
+// appended to the user message after the sentinel, so they land at the end of the per-request part
+// (text first, then media - the order the caller sent it).
 std::pair<std::string, std::string> render_prompt(const common_chat_templates * tmpls, bool use_jinja,
-                                                  const std::string & system_text, const std::string & context);
+                                                  const std::string & system_text, const std::string & context,
+                                                  const std::vector<std::string> & media_markers = {});
 
 // {"decision": {...}, "fields": {...}} from the scores, applying each numeric field's aggregate.
 common_json assemble(const compiled_schema & cs, const result & r);
