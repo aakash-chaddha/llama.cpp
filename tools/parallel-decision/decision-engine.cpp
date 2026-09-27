@@ -775,6 +775,17 @@ common_json assemble(const compiled_schema & cs, const result & r) {
         f["probability"]  = (double) (fr.probs.size() == sp.values.size() ? fr.probs[idx] : fr.path_score);
         f["scored_nodes"] = fr.scored_nodes;
         f["tree"]         = fr.tree;
+        // a full distribution over the allowed values, present exactly when every value was scored
+        if (fr.probs.size() == sp.values.size()) {
+            common_json candidates = common_json::array();
+            for (size_t k = 0; k < sp.values.size(); ++k) {
+                common_json candidate = common_json::object();
+                candidate["value"]       = sp.values[k];
+                candidate["probability"] = (double) fr.probs[k];
+                candidates.push_back(candidate);
+            }
+            f["candidates"] = candidates;
+        }
         fields[sp.name]   = f;
     }
     common_json out = common_json::object();
