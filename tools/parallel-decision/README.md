@@ -21,15 +21,29 @@ cmake --build build --config Release -j
 
 ## Run the server
 
-`--decision-seqs N` reserves the sequence slots the decisions need: one holds the cached instructions, one per context
-in flight, the rest are the parallel questions. It also switches the KV cache to unified, which is what lets the
-branches share the context's cells.
+`--decision-seqs N` reserves the sequence slots the decisions need: one holds the cached instructions, one per
+context in flight, the rest are the parallel questions (at least 3). It also switches the KV cache to unified, which
+is what lets the branches share the context's cells. `--ubatch-size` has to be at least as large as the largest image,
+because an image is decoded in one non-causal batch, and media contexts need `--mmproj` - without it they are a 400.
 
 ```bash
-./build/bin/llama-server -m model.gguf -ngl 99 -fa on -c 32768 --decision-seqs 24 --port 8096
+./build/bin/llama-server -m models/gemma-4-12b-it-UD-Q4_K_XL.gguf \
+  --mmproj models/gemma-4-12b-mmproj-F16.gguf -ngl 99 -fa on -c 32768 --parallel 1 \
+  --ubatch-size 2048 --cache-type-k q8_0 --cache-type-v q8_0 --jinja \
+  --decision-seqs 12 --port 8096
 ```
 
-With a presets file, one loaded model serves chat and decisions:
+| flag | why |
+|---|---|
+| `--decision-seqs N` | enables `/v1/decision` and reserves its sequences; also enables the unified KV cache |
+| `--ubatch-size N` | must be >= the token count of the largest image, or the request fails with `400 image needs N tokens, raise --ubatch-size to at least N` |
+| `--mmproj FILE` | the vision/audio tower; media contexts need it |
+| `--cache-type-k/v q8_0` | a 32k context on a 24 GB card: 12.5 GB against 15.5 GB with f16 |
+| `--jinja` | the chat template the decision prompt is rendered with |
+| `-fa on` | required for a quantized V cache, and the fastest prefill |
+| `--parallel 1` | decisions are sized from `--decision-seqs`, not from the slot count |
+
+With a presets file, one process serves chat and decisions and can hold more than one model:
 
 ```ini
 [*]
@@ -40,17 +54,28 @@ parallel = 1
 cache-type-k = q8_0
 cache-type-v = q8_0
 decision-seqs = 24
+ubatch-size = 2048
 
 [gemma-4-12b]
 model = ./models/gemma-4-12b-it-UD-Q4_K_XL.gguf
+mmproj = ./models/gemma-4-12b-mmproj-F16.gguf
 ctx-size = 32768
-ubatch-size = 512
 decision-seqs = 12
+
+[qwen3.5-0.8b]
+model = ./models/Qwen3.5-0.8B-UD-IQ2_M.gguf
+ctx-size = 32768
 ```
 
 ```bash
-./build/bin/llama-server --models-preset models.ini --models-max 1 --port 8096
+./build/bin/llama-server --models-preset models.ini --models-max 2 --port 8096
 ```
+
+`--models-max 2` keeps two models resident, so a client can switch between them without a reload: the router lists
+every preset in `GET /v1/models` and each request picks one with its `model` field.
+
+The encoder cache of media contexts is on by default; `--no-decision-media-cache` (or `LLAMA_ARG_DECISION_MEDIA_CACHE=0`)
+turns it off, and a request can opt out with `"cache_media": false`.
 
 How many sequences a model affords depends on its attention. A plain-attention model shares the context's cells, so
 128 sequences cost almost nothing. A sliding-window model (Gemma) allocates its window per sequence, so keep it low
@@ -120,38 +145,52 @@ Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 | `mode` | `auto` | `tree` scores every divergence node and returns exact probabilities; `greedy` walks the trie; `auto` picks tree up to `tree_max` values |
 | `tree_max` | 128 | per-field switch between tree and greedy |
 | `cache_prompt` | true | reuse the cached instructions + schema prefix |
+| `cache_media` | server default | reuse the encoder output of a media file this server has already seen (`--decision-media-cache` / `--no-decision-media-cache` sets the default) |
 
 ### Media contexts
 
-A context can be a string, or an array of content parts made of any number of `text` parts and **at most one**
-`image_url`. The image must be a base64 `data:image/...` URL; audio, video and more than one image per context are
-rejected with a 400, and the model needs an `mmproj` (`--mmproj`). This is the OpenAI content-part shape the chat
-endpoint already takes, so a multimodal client can address `/v1/decision` directly:
+A context can be a string, or an array of content parts: any number of `text`, `image_url` and `input_audio`
+parts. An image must be a base64 `data:image/...` URL; audio is raw base64 or a `data:` URL (mtmd auto-detects
+the format from the magic bytes). Video is rejected with a 400 - mtmd has no video chunk type, so send frames as
+`image_url` parts. The model needs an `mmproj` (`--mmproj`) carrying the matching encoder. This is the OpenAI
+content-part shape the chat endpoint already takes, so a multimodal client can address `/v1/decision` directly:
 
 ```json
 {
   "model": "gemma-4-12b",
-  "instructions": "Count what the animal in the image shows. The pixels are the evidence.",
+  "instructions": "Decide from the screenshots and the call recording. The media is the evidence.",
   "schema": {
     "type":  {"type": "enum", "choices": ["animal", "person", "object"], "description": "The main subject."},
     "legs":  {"type": "integer", "minimum": 0, "maximum": 5, "description": "How many legs are visible."}
   },
   "contexts": [[
-    {"type": "text", "text": ""},
-    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+    {"type": "text", "text": "The checkout screen, then the error, then the call."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+    {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}}
   ]]
 }
 ```
 
-The pixels are the evidence: the image is encoded once per request and decoded into the decision's trunk before the
-branches fork, so every field is scored conditioned on the image itself - no caption is generated in between, and the
-whole request is one pass. `usage.media_tokens` (per result and per request) reports how many memory cells the image
-occupied; `prompt_tokens` includes them.
+The media is the evidence: every part is encoded once per request and decoded into the decision's trunk in part
+order - markers are appended after the context text, so a context reads text first, then its media - before the
+branches fork. Every field is scored conditioned on the pixels or the waveform itself, no caption is generated in
+between, and the whole request is one pass. `usage.media_tokens` (per result and per request) reports how many
+memory cells the media occupied; `prompt_tokens` includes them.
 
-A whole image has to fit in one `ubatch`, because the non-causal attention span cannot be split. If it does not, the
-request fails with `image needs N tokens, raise --ubatch-size to at least N` instead of aborting the server - so set
-`--ubatch-size` (or `ubatch-size` in a preset) to at least the largest image you expect. Text parts keep the cached
-shared prefix, and a request can mix image contexts and plain-text contexts in any order.
+A media part whose attention span is non-causal (an image, for every projector but Gemma's causal ones) has to fit
+in one `ubatch`. If it does not, the request fails with `image needs N tokens, raise --ubatch-size to at least N`
+instead of aborting the server - so set `--ubatch-size` (or `ubatch-size` in a preset) to at least the largest image
+you expect. Causal media (audio) is split into batches by the mtmd helper and has no such limit. Text parts keep the
+cached shared prefix, and a request can mix media contexts and plain-text contexts in any order.
+
+The encoder output of a media file is cached between requests when `--decision-media-cache` is on (the default).
+mtmd gives every file a bitmap id that is a SHA-256 of its bytes, and the same bytes always encode to the same
+vectors whatever prompt surrounds them, so the id is the whole key. It is exact, but it is also small: on
+gemma-4-12b it saves 5 ms on a 1024px image and 19 ms on a 2310x3072 one, because the encoder is not where the
+time is - a repeat still pays the bitmap decode + preprocessing (~200 ms for that large image) and the media
+decode into the trunk (210-345 ms). `usage.media_cached_tokens` reports the tokens served from the cache, and
+`cache_media: false` in the request turns it off for that request.
 
 ## CLI
 

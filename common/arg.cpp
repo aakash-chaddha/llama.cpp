@@ -2557,6 +2557,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_seq_decision = value;
             }
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-media-cache"},
+            {"--no-decision-media-cache"},
+            string_format("whether /decision reuses the encoder output of media it has already seen (default: %s)", params.decision_media_cache ? "enabled" : "disabled"),
+            [](common_params & params, bool value) {
+                params.decision_media_cache = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_MEDIA_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

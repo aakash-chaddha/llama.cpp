@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <unordered_map>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -55,6 +56,66 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
 }
+
+// Level-1 cache for /decision: the encoder output of media it has already seen. mtmd gives every media
+// file a bitmap id that is a SHA-256 of its bytes, and the same bytes always encode to the same vectors
+// whatever prompt surrounds them, so the id alone is the whole key. Nothing else is cached: the prefix,
+// the context text, the decode of the media into the decision trunk and the scoring all still run per
+// request. The vectors live in host memory, least-recently-used, capped by bytes.
+class decision_media_cache {
+  public:
+    explicit decision_media_cache(size_t max_embd_bytes = 256ull * 1024 * 1024) : max_embd_bytes(max_embd_bytes) {}
+
+    // the vectors this bitmap encoded to, or nullptr
+    std::shared_ptr<std::vector<float>> embd(const std::string & id) {
+        const auto it = embd_map.find(id);
+        if (it == embd_map.end()) {
+            return nullptr;
+        }
+        it->second.used = ++tick;
+        return it->second.data;
+    }
+
+    void put(const std::string & id, const float * data, size_t n) {
+        const size_t bytes = n * sizeof(float);
+        if (bytes == 0 || bytes > max_embd_bytes) {
+            return; // a single entry may not take the whole budget
+        }
+        const auto it = embd_map.find(id);
+        if (it != embd_map.end()) {
+            embd_bytes -= it->second.bytes;
+            embd_map.erase(it);
+        }
+        entry e;
+        e.data  = std::make_shared<std::vector<float>>(data, data + n);
+        e.bytes = bytes;
+        e.used  = ++tick;
+        embd_map.emplace(id, std::move(e));
+        embd_bytes += bytes;
+        while (embd_bytes > max_embd_bytes && !embd_map.empty()) {
+            auto oldest = embd_map.begin();
+            for (auto i = embd_map.begin(); i != embd_map.end(); ++i) {
+                if (i->second.used < oldest->second.used) {
+                    oldest = i;
+                }
+            }
+            embd_bytes -= oldest->second.bytes;
+            embd_map.erase(oldest);
+        }
+    }
+
+  private:
+    struct entry {
+        std::shared_ptr<std::vector<float>> data;
+        size_t   bytes = 0;
+        uint64_t used  = 0;
+    };
+
+    size_t   max_embd_bytes;
+    size_t   embd_bytes = 0;
+    uint64_t tick = 0;
+    std::unordered_map<std::string, entry> embd_map;
+};
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
@@ -854,6 +915,7 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
     std::unique_ptr<llama_decision::engine> decision_engine; // created by the first /decision request
+    std::unique_ptr<decision_media_cache>   decision_media;  // encoder output of media already seen
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -2465,6 +2527,10 @@ private:
             decision_engine = std::make_unique<llama_decision::engine>(ctx_tgt, (llama_seq_id) params_base.n_parallel,
                                                                         params_base.n_seq_decision);
         }
+        if (!decision_media) {
+            decision_media = std::make_unique<decision_media_cache>();
+            SRV_INF("decision media cache: %s\n", params_base.decision_media_cache ? "enabled" : "disabled");
+        }
         const auto cs = llama_decision::compile_schema(body.at("schema"), body.value("instructions", std::string()));
 
         std::string shared;
@@ -2472,7 +2538,10 @@ private:
         std::vector<server_tokens> tokenized; // keeps this request's media chunks alive
         tokenized.reserve(parsed.size());
         std::vector<const mtmd_input_chunk *> media_chunks;
+        std::vector<std::string>              media_ids;   // mtmd's bitmap id per chunk: a SHA-256 of the media bytes
+        std::vector<size_t>                   media_owner; // the context each chunk belongs to
         std::vector<size_t> context_media_tokens(parsed.size(), 0);
+        std::vector<size_t> context_media_cached(parsed.size(), 0);
         for (size_t i = 0; i < parsed.size(); ++i) {
             auto & ctx = parsed[i];
             std::vector<std::string> markers(ctx.media.size(), get_media_marker());
@@ -2501,7 +2570,10 @@ private:
                         segments[i].push_back(llama_decision::context_segment::of_text(std::move(text)));
                         text.clear();
                     }
-                    const auto * chunk = media[next].second;
+                    const auto * chunk    = media[next].second;
+                    const char * chunk_id = mtmd_input_chunk_get_id(chunk);
+                    media_ids.emplace_back(chunk_id ? chunk_id : "");
+                    media_owner.push_back(i);
                     segments[i].push_back(llama_decision::context_segment::of_media((int) media_chunks.size()));
                     media_chunks.push_back(chunk);
                     context_media_tokens[i] += mtmd_input_chunk_get_n_tokens(chunk);
@@ -2532,12 +2604,16 @@ private:
             }
         }
 
-        // encode every media chunk once; the batches keep the embeddings alive for the whole scoring pass
-        std::vector<float *>         media_embds;
+        // Media is encoded once, up front, never from inside the engine: the engine has llama_decode
+        // graphs in flight while it walks the context segments, and the encoder must not run on the
+        // same backend at the same time (the WebGPU backend is asynchronous). One batch per chunk
+        // stays alive until the request ends, because the embeddings are pointers into it.
+        const bool cache_media = body.value("cache_media", params_base.decision_media_cache);
         std::vector<mtmd::batch_ptr> media_batches;
-        media_embds.reserve(media_chunks.size());
         media_batches.reserve(media_chunks.size());
-        for (const auto * chunk : media_chunks) {
+        const size_t n_embd_media = (size_t) llama_model_n_embd_inp(llama_get_model(ctx_tgt));
+        auto encode_media = [&](int idx) -> float * {
+            const auto * chunk = media_chunks[idx];
             mtmd::batch_ptr mbatch(mtmd_batch_init(mctx));
             int32_t rc = mtmd_batch_add_chunk(mbatch.get(), chunk);
             if (rc == 0) {
@@ -2550,17 +2626,45 @@ private:
             if (embd == nullptr) {
                 throw std::runtime_error("the media encoder returned no embeddings");
             }
-            media_embds.push_back(embd);
             media_batches.push_back(std::move(mbatch));
+            return embd;
+        };
+
+        // Resolve every chunk's embeddings before the engine runs: from the cache when this session has
+        // seen the file, by encoding it otherwise. Cached vectors are held for the whole request so an
+        // eviction cannot free one mid-flight.
+        std::vector<std::shared_ptr<std::vector<float>>> media_keep;
+        std::vector<float *> media_embds(media_chunks.size(), nullptr);
+        std::vector<char>    media_was_cached(media_chunks.size(), 0);
+        for (size_t idx = 0; idx < media_chunks.size(); ++idx) {
+            if (cache_media) {
+                auto cached = decision_media->embd(media_ids[idx]);
+                if (cached) {
+                    media_embds[idx]    = cached->data();
+                    media_was_cached[idx] = 1;
+                    media_keep.push_back(std::move(cached));
+                }
+            }
+            if (media_embds[idx] == nullptr) {
+                media_embds[idx] = encode_media((int) idx);
+                if (cache_media) {
+                    decision_media->put(media_ids[idx], media_embds[idx],
+                                        n_embd_media * mtmd_input_chunk_get_n_tokens(media_chunks[idx]));
+                }
+            }
         }
 
         llama_decision::media_decoder decode_media;
         if (!media_chunks.empty()) {
             decode_media = [&](llama_seq_id seq, llama_pos pos, int idx) -> llama_pos {
+                const auto * chunk = media_chunks[idx];
+                if (media_was_cached[idx]) {
+                    context_media_cached[media_owner[idx]] += mtmd_input_chunk_get_n_tokens(chunk);
+                }
+                float *       embd        = media_embds[idx];
                 llama_pos     new_n_past = pos;
-                const int32_t rc = mtmd_helper_decode_image_chunk(mctx, ctx_tgt, media_chunks[idx], media_embds[idx],
-                                                                  pos, seq, llama_n_batch(ctx_tgt), &new_n_past,
-                                                                  nullptr, nullptr);
+                const int32_t rc = mtmd_helper_decode_image_chunk(mctx, ctx_tgt, chunk, embd, pos, seq,
+                                                                  llama_n_batch(ctx_tgt), &new_n_past, nullptr, nullptr);
                 if (rc != 0) {
                     throw std::runtime_error("failed to decode the media into a decision branch (rc = " + std::to_string(rc) + ")");
                 }
@@ -2583,11 +2687,16 @@ private:
         for (size_t n : context_media_tokens) {
             media_tokens += n;
         }
+        size_t media_cached_tokens = 0;
+        for (size_t n : context_media_cached) {
+            media_cached_tokens += n;
+        }
         json usage = json::object();
         usage["prompt_tokens"]  = (long long) (b.shared_tokens + context_tokens + media_tokens);
         usage["cached_tokens"]  = (long long) (b.cache_hit ? b.shared_tokens : 0);
         usage["context_tokens"] = (long long) context_tokens;
         usage["media_tokens"]   = (long long) media_tokens;
+        usage["media_cached_tokens"] = (long long) media_cached_tokens;
         usage["scored_rows"]    = b.rows;
         json timings = json::object();
         timings["prefill_ms"] = b.prefill_ms;
@@ -2600,9 +2709,10 @@ private:
         for (size_t i = 0; i < b.items.size(); ++i) {
             const auto & r = b.items[i];
             json item = llama_decision::assemble(cs, r);
-            item["usage"] = { { "context_tokens", (long long) r.context_tokens },
-                              { "media_tokens",   (long long) context_media_tokens[i] },
-                              { "scored_rows",    r.rows } };
+            item["usage"] = { { "context_tokens",      (long long) r.context_tokens },
+                              { "media_tokens",        (long long) context_media_tokens[i] },
+                              { "media_cached_tokens", (long long) context_media_cached[i] },
+                              { "scored_rows",         r.rows } };
             results.push_back(item);
         }
         json out = json::object();
