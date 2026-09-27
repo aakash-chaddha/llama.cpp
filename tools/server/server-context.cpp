@@ -2387,11 +2387,13 @@ private:
         if (!body.contains("contexts") || !body.at("contexts").is_array() || body.at("contexts").empty() || body.at("contexts").size() > 256) {
             throw std::invalid_argument("\"contexts\" must be an array of 1-256 contexts");
         }
-        // one context is a string, or an array of content parts: any number of text parts and at
-        // most one image_url holding a base64 data URL. Audio and video are not supported.
+        // one context is a string, or an array of content parts: any number of text parts plus
+        // image_url and input_audio parts, each a base64 data URL. Media keeps part order; the
+        // markers are appended after the text, so the context reads text first, then its media.
+        // Video has no mtmd chunk type: frames would have to arrive as image_url parts.
         struct parsed_context {
             std::string             text;
-            std::vector<raw_buffer> images; // 0 or 1
+            std::vector<raw_buffer> media; // in part order; mtmd auto-detects image vs audio
         };
         std::vector<parsed_context> parsed;
         parsed.reserve(body.at("contexts").size());
@@ -2420,20 +2422,35 @@ private:
                         if (!mctx || !mtmd_support_vision(mctx)) {
                             throw std::invalid_argument("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                         }
-                        if (!ctx.images.empty()) {
-                            throw std::invalid_argument("a decision context takes at most one image");
-                        }
                         const json image_url = part.value("image_url", json::object());
                         const std::string url = image_url.value("url", std::string());
                         if (!string_starts_with(url, "data:image/")) {
                             throw std::invalid_argument("a decision image must be a base64 data:image/... URL");
                         }
-                        handle_media(ctx.images, url, std::string());
-                        if (ctx.images.empty()) {
+                        const size_t n_before = ctx.media.size();
+                        handle_media(ctx.media, url, std::string());
+                        if (ctx.media.size() == n_before) {
                             throw std::invalid_argument("could not decode the decision image");
                         }
+                    } else if (type == "input_audio") {
+                        if (!mctx || !mtmd_support_audio(mctx)) {
+                            throw std::invalid_argument("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                        }
+                        // same as the chat path: "data" (raw base64 or a data: URL) or "url"
+                        const json input_audio = part.value("input_audio", json::object());
+                        const std::string url = input_audio.value("data", input_audio.value("url", std::string()));
+                        if (url.empty()) {
+                            throw std::invalid_argument("an \"input_audio\" content part needs \"data\" or \"url\"");
+                        }
+                        const size_t n_before = ctx.media.size();
+                        handle_media(ctx.media, url, std::string());
+                        if (ctx.media.size() == n_before) {
+                            throw std::invalid_argument("could not decode the decision audio");
+                        }
+                    } else if (type == "input_video") {
+                        throw std::invalid_argument("video input is not supported by \"contexts\": send frames as \"image_url\" parts");
                     } else {
-                        throw std::invalid_argument("\"contexts\" content parts support \"text\" and \"image_url\", got \"" + type + "\"");
+                        throw std::invalid_argument("\"contexts\" content parts support \"text\", \"image_url\" and \"input_audio\", got \"" + type + "\"");
                     }
                 }
             } else {
@@ -2458,10 +2475,7 @@ private:
         std::vector<size_t> context_media_tokens(parsed.size(), 0);
         for (size_t i = 0; i < parsed.size(); ++i) {
             auto & ctx = parsed[i];
-            std::vector<std::string> markers;
-            if (!ctx.images.empty()) {
-                markers.push_back(get_media_marker());
-            }
+            std::vector<std::string> markers(ctx.media.size(), get_media_marker());
             auto [head, tail] = llama_decision::render_prompt(chat_params.tmpls.get(), chat_params.use_jinja,
                                                               cs.system_text, ctx.text, markers);
             if (i == 0) {
@@ -2469,13 +2483,14 @@ private:
             } else if (head != shared) {
                 throw std::runtime_error("the chat template renders a different prefix per context");
             }
-            if (ctx.images.empty()) {
+            if (ctx.media.empty()) {
                 segments[i].push_back(llama_decision::context_segment::of_text(
                     llama_decision::tokenize_text(vocab, tail, shared.empty())));
                 continue;
             }
-            // the tail carries the media marker: mtmd splits it into text chunks around one image chunk
-            tokenized.push_back(process_mtmd_prompt(mctx, tail, ctx.images, init_opt,
+            // the tail carries one marker per media part: mtmd splits it into text chunks around one
+            // chunk per marker, in part order
+            tokenized.push_back(process_mtmd_prompt(mctx, tail, ctx.media, init_opt,
                                                     /*is_placeholder*/ false, /*add_special*/ shared.empty()));
             const auto & st    = tokenized.back();
             const auto   media = st.media_chunks();
@@ -2502,17 +2517,22 @@ private:
             }
         }
 
-        // a whole image must fit in one ubatch: the decode asserts on it, so refuse it here instead
+        // a non-causal span (an image) must fit in one ubatch: the decode asserts on it, so refuse it
+        // here instead. Causal media (audio) is split into batches by the helper and needs no guard.
         const size_t n_ubatch = llama_n_ubatch(ctx_tgt);
         for (const auto * chunk : media_chunks) {
+            if (!mtmd_decode_use_non_causal(mctx, chunk)) {
+                continue;
+            }
             const size_t n = mtmd_input_chunk_get_n_tokens(chunk);
             if (n > n_ubatch) {
-                throw std::invalid_argument("image needs " + std::to_string(n) +
+                const bool audio = mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_AUDIO;
+                throw std::invalid_argument(std::string(audio ? "audio" : "image") + " needs " + std::to_string(n) +
                                             " tokens, raise --ubatch-size to at least " + std::to_string(n));
             }
         }
 
-        // encode every image once; the batches keep the embeddings alive for the whole scoring pass
+        // encode every media chunk once; the batches keep the embeddings alive for the whole scoring pass
         std::vector<float *>         media_embds;
         std::vector<mtmd::batch_ptr> media_batches;
         media_embds.reserve(media_chunks.size());
@@ -2524,11 +2544,11 @@ private:
                 rc = mtmd_batch_encode(mbatch.get());
             }
             if (rc != 0) {
-                throw std::runtime_error("failed to encode the decision image (rc = " + std::to_string(rc) + ")");
+                throw std::runtime_error("failed to encode the decision media (rc = " + std::to_string(rc) + ")");
             }
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk);
             if (embd == nullptr) {
-                throw std::runtime_error("the image encoder returned no embeddings");
+                throw std::runtime_error("the media encoder returned no embeddings");
             }
             media_embds.push_back(embd);
             media_batches.push_back(std::move(mbatch));
@@ -2542,7 +2562,7 @@ private:
                                                                   pos, seq, llama_n_batch(ctx_tgt), &new_n_past,
                                                                   nullptr, nullptr);
                 if (rc != 0) {
-                    throw std::runtime_error("failed to decode the image into a decision branch (rc = " + std::to_string(rc) + ")");
+                    throw std::runtime_error("failed to decode the media into a decision branch (rc = " + std::to_string(rc) + ")");
                 }
                 return new_n_past;
             };
